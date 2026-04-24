@@ -8,6 +8,15 @@ from rdkit import DataStructs
 
 
 class CJTVAE_XGB_Env:
+    """
+    Reinforcement learning environment for ligand optimization.
+
+    This environment wraps a pre-trained JT-VAE generator and an XGBoost
+    surrogate model to provide reward signals for PPO-based molecular
+    optimization in latent space. Rewards are computed based on predicted
+    Am/Eu separation factors and structural similarity to known ligands.
+    """
+
     def __init__(
             self,
             cjtvae_model,
@@ -16,12 +25,12 @@ class CJTVAE_XGB_Env:
             data_file_path='/home/dc/data_new/S.xlsx',
             latent_dim=48,
             z_prior=None,
-            # ---------- reward control ----------
+            # Reward control parameters
             similarity_threshold=0.3,
-            similarity_gate_k=0.05,  # ⭐ sigmoid 平滑度
-            topk_similarity=2,  # ⭐ Top-K 相似分子
+            similarity_gate_k=0.05,
+            topk_similarity=2,
             topk_similarity_sol=5,
-            reward_scale=1.0,  # ⭐ PPO 稳定性
+            reward_scale=1.0,
     ):
         self.model = cjtvae_model.eval().to(device)
         self.xgb = xgb_model
@@ -36,29 +45,33 @@ class CJTVAE_XGB_Env:
         self.topk_similarity_sol = topk_similarity_sol
         self.reward_scale = reward_scale
 
-        # 加载数据文件
+        # Load reference database for similarity computation
         self.data_file_path = data_file_path
         self._load_and_prepare_data()
 
     def _similarity_gate(self, sim):
         """
-        Continuous gate in (0, 1)
+        Smooth sigmoid gate mapping similarity to (0, 1).
+
+        Provides a continuous transition between low and high similarity
+        regimes for the exploration reward.
         """
         return 1.0 / (1.0 + np.exp(-(sim - self.similarity_threshold) / self.similarity_gate_k))
 
     def _find_topk_similar(self, query_smiles, k=5, deduplicate=True):
         """
-        快速在数据库中找到与查询分子最相似的k个分子
+        Find the top-k most similar molecules in the reference database.
 
         Args:
-            query_smiles: 查询分子的SMILES
-            k: 返回的相似分子数量
-            deduplicate: 是否对SMILES去重（True用于相似度计算，False用于溶剂匹配）
+            query_smiles: SMILES string of the query molecule.
+            k: Number of similar molecules to return.
+            deduplicate: If True, return unique SMILES (for similarity scoring);
+                         if False, allow duplicates (for solvent condition matching).
 
         Returns:
-            - rows: DataFrame行的列表
-            - sims: 相似度分数的列表
-            - unique_smiles: 去重后的SMILES列表（当deduplicate=True时）
+            rows: List of DataFrame rows for matched molecules.
+            sims: List of Tanimoto similarity scores.
+            unique_smiles: List of unique SMILES (only when deduplicate=True).
         """
         mol = Chem.MolFromSmiles(query_smiles)
         if mol is None:
@@ -69,7 +82,7 @@ class CJTVAE_XGB_Env:
 
         query_fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512)
 
-        # 计算与所有分子的相似度
+        # Compute similarities to all database molecules
         similarities = DataStructs.BulkTanimotoSimilarity(
             query_fp, self.database_explicit_bvs
         )
@@ -81,8 +94,7 @@ class CJTVAE_XGB_Env:
                 return [], []
 
         if deduplicate:
-            # ========== 去重模式：用于相似度计算 ==========
-            # 创建 (smiles, max_similarity) 的映射
+            # Deduplication mode: keep only the best match per unique SMILES
             smiles_to_max_sim = {}
             smiles_to_best_idx = {}
 
@@ -92,22 +104,20 @@ class CJTVAE_XGB_Env:
                     smiles_to_max_sim[smi] = sim
                     smiles_to_best_idx[smi] = idx
 
-            # 按相似度排序，取top-k个唯一SMILES
+            # Sort by similarity and take top-k unique SMILES
             unique_smiles = sorted(smiles_to_max_sim.keys(),
                                    key=lambda x: smiles_to_max_sim[x],
                                    reverse=True)[:k]
 
-            # 获取对应的相似度
             unique_sims = [smiles_to_max_sim[smi] for smi in unique_smiles]
 
-            # 获取对应的行（每个唯一SMILES取相似度最高的那条记录）
             unique_rows = [self.database_df.iloc[smiles_to_best_idx[smi]]
                            for smi in unique_smiles]
 
             return unique_rows, unique_sims, unique_smiles
 
         else:
-            # ========== 不去重模式：用于溶剂匹配 ==========
+            # Non-deduplication mode: allow multiple entries with same SMILES
             idxs = np.argsort(similarities)[-k:][::-1]
             rows = [self.database_df.iloc[i] for i in idxs]
             sims = [similarities[i] for i in idxs]
@@ -115,7 +125,7 @@ class CJTVAE_XGB_Env:
             return rows, sims
 
     def _load_and_prepare_data(self):
-        """加载数据文件并准备用于相似性搜索"""
+        """Load the reference ligand database and precompute fingerprints for similarity search."""
         self.data_df = pd.read_excel(self.data_file_path, sheet_name='main')
 
         required_columns = [
@@ -126,9 +136,9 @@ class CJTVAE_XGB_Env:
         ]
         missing_cols = [c for c in required_columns if c not in self.data_df.columns]
         if missing_cols:
-            raise ValueError(f"数据文件缺少必要的列: {missing_cols}")
+            raise ValueError(f"Data file missing required columns: {missing_cols}")
 
-        print("正在计算数据库中配体的指纹...")
+        print("Computing fingerprints for database ligands...")
 
         database_explicit_bvs = []
         valid_masks = []
@@ -146,11 +156,23 @@ class CJTVAE_XGB_Env:
         self.database_df = self.data_df[valid_masks].reset_index(drop=True)
         self.database_explicit_bvs = database_explicit_bvs
 
-        print(f"数据库加载完成，有效分子数：{len(self.database_df)}")
+        print(f"Database loaded: {len(self.database_df)} valid molecules")
 
     @torch.no_grad()
     def decode(self, z):
-        """批量解码，分批处理避免卡死"""
+        """
+        Batch decode latent vectors to SMILES strings.
+
+        Processing is done in small chunks to prevent hanging on
+        difficult-to-decode latent points.
+
+        Args:
+            z: Latent vectors of shape [batch_size, latent_dim].
+
+        Returns:
+            smiles: List of SMILES strings (None for failed decodings).
+            valid: Boolean array indicating which decodings succeeded.
+        """
         if torch.isnan(z).any() or torch.isinf(z).any():
             return [None] * z.size(0), np.zeros(z.size(0), dtype=np.bool_)
 
@@ -162,20 +184,19 @@ class CJTVAE_XGB_Env:
         smiles = []
         valid = []
 
-        # 分批处理，每批最多4个
+        # Process in chunks of 4 to limit decoding time per batch
         chunk_size = 4
         for i in range(0, batch_size, chunk_size):
             chunk_z = z[i:i + chunk_size]
 
             try:
-                # 设置一个总的超时时间
                 import signal
 
                 def timeout_handler(signum, frame):
                     raise TimeoutError("Batch decode timeout")
 
                 signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(10)  # 每批最多10秒
+                signal.alarm(10)  # Maximum 10 seconds per chunk
 
                 try:
                     chunk_smiles = self.model.decode_from_latent(chunk_z)
@@ -197,13 +218,12 @@ class CJTVAE_XGB_Env:
                     signal.alarm(0)
 
             except TimeoutError:
-                print(f"⚠️ 解码批次超时: samples {i}-{i + chunk_size - 1}")
-                # 这一批全部标记为无效
+                print(f"Warning: decode timeout for samples {i}-{i + chunk_size - 1}")
                 for _ in range(chunk_size):
                     smiles.append(None)
                     valid.append(False)
             except Exception as e:
-                print(f"⚠️ 解码批次错误: {e}")
+                print(f"Warning: decode error: {e}")
                 for _ in range(chunk_size):
                     smiles.append(None)
                     valid.append(False)
@@ -211,11 +231,15 @@ class CJTVAE_XGB_Env:
         return smiles, np.array(valid, dtype=np.bool_)
 
     def _manual_decode(self, z):
-        """手动解码潜变量"""
+        """
+        Manual decoding by splitting the latent vector into tree and molecular components.
+
+        This is a fallback method that directly calls the model's decode function
+        with separated tree and molecular latent vectors.
+        """
         batch_size = z.size(0)
         smiles = []
 
-        # 分割潜变量
         tree_dim = self.latent_dim // 2
         mol_dim = self.latent_dim // 2
 
@@ -224,7 +248,6 @@ class CJTVAE_XGB_Env:
                 tree_vec = z[i, :tree_dim].unsqueeze(0)
                 mol_vec = z[i, tree_dim:].unsqueeze(0)
 
-                # 调用模型的decode方法
                 smi = self.model.decode(
                     x_tree_vecs=tree_vec,
                     x_mol_vecs=mol_vec,
@@ -238,7 +261,7 @@ class CJTVAE_XGB_Env:
         return smiles
 
     def smiles_to_fingerprint_array(self, smiles):
-        """SMILES转指纹数组"""
+        """Convert a SMILES string to a 512-bit Morgan fingerprint array."""
         mol = Chem.MolFromSmiles(smiles) if smiles and isinstance(smiles, str) else None
         if mol:
             fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512)
@@ -249,12 +272,13 @@ class CJTVAE_XGB_Env:
 
     def prepare_xgb_features(self, ligand_fp_array, row):
         """
-        特征结构（严格对齐 XGB 训练）：
-        512 ligand
-        4×512 (Solvent1, Solvent2, Medium1, Medium2)
-        4 numeric (me1_c, me2_c, ligand_c, T)
-        """
+        Build the feature vector for XGBoost prediction.
 
+        Feature structure (aligned with XGBoost training):
+          512-d ligand fingerprint
+          4 × 512-d solvent fingerprints (Solvent1, Solvent2, Medium1, Medium2)
+          4 numeric features (me1_c, me2_c, ligand_c, T)
+        """
         env_fps = []
         for col in ['Solvent1', 'Solvent2', 'Medium1', 'Medium2']:
             smi = row[col]
@@ -281,13 +305,18 @@ class CJTVAE_XGB_Env:
 
     def compute_reward(self, z, smiles, valid_mask):
         """
-        Reward = signal (SF) + exploration (similarity bonus)
-        """
+        Compute the composite reward for each generated molecule.
 
+        Reward = signal (predicted SF) + exploration (similarity-based bonus).
+
+        The signal reward uses a soft aggregation over the top-k most similar
+        reference molecules with their experimental conditions. The exploration
+        bonus encourages generation of molecules with moderate structural novelty.
+        """
         rewards = []
         infos = []
 
-        # ---------- hyper-parameters ----------
+        # Reward hyperparameters
         TEMP_SF = 10.0
         W_SIGNAL = 1.0
         W_EXPLORE = 0.3
@@ -298,7 +327,7 @@ class CJTVAE_XGB_Env:
 
         for i, smi in enumerate(smiles):
 
-            # ---------- invalid molecule ----------
+            # Invalid molecule: assign negative penalty
             if not valid_mask[i] or (smi and len(smi) <= 3):
                 rewards.append(-0.2)
                 infos.append({"valid": False})
@@ -310,23 +339,20 @@ class CJTVAE_XGB_Env:
                 infos.append({"valid": False})
                 continue
 
-            # ---------- ligand fingerprint ----------
+            # Compute ligand fingerprint
             lig_fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512)
             lig_fp_arr = np.zeros(512, dtype=np.float32)
             DataStructs.ConvertToNumpyArray(lig_fp, lig_fp_arr)
 
-            # ======================================================
-            # 关键修改：两套topk
-            # ======================================================
-
-            # 1. 用于溶剂匹配的topk（不去重，允许多种实验条件）
+            # Two separate top-k queries:
+            # 1. For solvent condition matching (no dedup, preserves diverse conditions)
             rows_for_solvent, _ = self._find_topk_similar(
                 smi,
                 k=self.topk_similarity_sol,
                 deduplicate=False
             )
 
-            # 2. 用于相似度计算的topk（去重，只看结构多样性）
+            # 2. For structural similarity scoring (dedup, focuses on unique structures)
             _, sims_unique, unique_smiles = self._find_topk_similar(
                 smi,
                 k=self.topk_similarity,
@@ -338,25 +364,22 @@ class CJTVAE_XGB_Env:
                 infos.append({"valid": True, "has_neighbor": False})
                 continue
 
-            # ======================================================
-            # 1 Signal: SF under realistic conditions
-            # 使用不去重的rows_for_solvent（保留多种溶剂条件）
-            # ======================================================
+            # ---- Signal reward: predicted SF under realistic conditions ----
             sf_list = []
             for row in rows_for_solvent:
                 x = self.prepare_xgb_features(lig_fp_arr, row)
                 sf = float(self.xgb.predict(x)[0])
-                sf = np.exp(sf) - 1
+                sf = np.exp(sf) - 1  # Inverse log-transform
                 sf_list.append(sf)
 
             sf_arr = np.array(sf_list, dtype=np.float32)
 
-            # soft aggregation
+            # Soft aggregation: weighted average with temperature scaling
             weights = np.exp(sf_arr / TEMP_SF)
             weights /= (weights.sum() + 1e-8)
             soft_sf = float((weights * sf_arr).sum())
 
-            # SF奖励衰减
+            # Apply logarithmic decay for very high SF values
             if soft_sf > SF_REWARD_THRESHOLD:
                 reward_sf = SF_REWARD_THRESHOLD + np.log1p(soft_sf - SF_REWARD_THRESHOLD)
             else:
@@ -364,31 +387,25 @@ class CJTVAE_XGB_Env:
 
             signal = W_SIGNAL * np.log1p(reward_sf)
 
-            # ======================================================
-            # 2 Exploration: similarity-shaped bonus
-            # 使用去重的sims_unique（基于唯一结构）
-            # ======================================================
+            # ---- Exploration bonus: similarity-shaped reward ----
             sim_arr = np.array(sims_unique, dtype=np.float32)
             sim_mean = float(sim_arr.mean())
 
-            # 记录用于调试的信息
             n_unique_structures = len(sims_unique)
             n_total_neighbors = len(rows_for_solvent)
 
-            # Gaussian-shaped exploration bonus
+            # Gaussian-shaped bonus centered at SIM_PEAK
             explore_bonus = np.exp(
                 -0.5 * ((sim_mean - SIM_PEAK) / SIM_SIGMA) ** 2
             )
 
-            # hard reliability gate
+            # Hard reliability gate: zero bonus below SIM_LOW
             if sim_mean < SIM_LOW:
                 explore_bonus *= 0.0
 
             exploration = W_EXPLORE * explore_bonus
 
-            # ======================================================
-            # Final reward
-            # ======================================================
+            # ---- Final composite reward ----
             reward = signal + exploration
 
             rewards.append(reward)
@@ -398,10 +415,10 @@ class CJTVAE_XGB_Env:
                 "reward_sf": reward_sf,
                 "signal": signal,
                 "explore_bonus": exploration,
-                "sim_mean": sim_mean,  # 现在基于去重后的结构
-                "n_unique_structures": n_unique_structures,  # 新增：实际有多少独特结构
-                "n_total_neighbors": n_total_neighbors,  # 新增：总共有多少邻居（含重复）
-                "unique_smiles_sample": unique_smiles[:3] if unique_smiles else [],  # 采样显示
+                "sim_mean": sim_mean,
+                "n_unique_structures": n_unique_structures,
+                "n_total_neighbors": n_total_neighbors,
+                "unique_smiles_sample": unique_smiles[:3] if unique_smiles else [],
             })
 
         rewards = np.array(rewards, dtype=np.float32)
@@ -412,6 +429,16 @@ class CJTVAE_XGB_Env:
         return rewards, infos
 
     def step(self, z):
+        """
+        Execute one environment step: decode latent vectors and compute rewards.
+
+        Args:
+            z: Latent vectors of shape [batch_size, latent_dim].
+
+        Returns:
+            A dictionary with 'reward', 'done' (always True for single-step),
+            and 'info' containing per-molecule diagnostics.
+        """
         smiles, valid_mask = self.decode(z)
         reward, info = self.compute_reward(z, smiles, valid_mask)
 
