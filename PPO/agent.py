@@ -3,32 +3,34 @@ import torch.nn as nn
 
 
 # ============================================================
-# 本文件定义了强化学习所需的核心模块：
-#   - Critic：分位数价值函数估计器
-#   - MolecularRLAgent：在 CJT-VAE 潜空间上做连续动作的 Agent
-#   - quantile_huber_loss：分位数回归 Huber 损失
-#   - PPOTrainer：基于上述 Agent 的 PPO 训练器
+# Core modules for reinforcement learning-based ligand optimization:
+#   - Critic: Quantile value function estimator
+#   - MolecularRLAgent: Continuous-action agent in CJT-VAE latent space
+#   - quantile_huber_loss: Quantile regression Huber loss
+#   - MultiStepPPOTrainer: PPO trainer with multi-step trajectory updates
 # ============================================================
+
+
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     """
-    计算广义优势估计(GAE)
+    Compute Generalized Advantage Estimation (GAE).
 
     Args:
-        rewards: [T, B] 或 [T,]，每个时间步的奖励
-        values: [T+1, B] 或 [T+1,]，每个状态的价值（包括最后状态）
-        dones: [T, B] 或 [T,]，是否终止
-        gamma: 折扣因子
-        lam: GAE参数
+        rewards: [T, B] or [T], rewards at each timestep.
+        values: [T+1, B] or [T+1], state values including the final state.
+        dones: [T, B] or [T], terminal flags.
+        gamma: Discount factor.
+        lam: GAE lambda parameter.
 
     Returns:
-        advantages: [T, B] 或 [T,]，优势函数
-        returns: [T, B] 或 [T,]，折扣回报
+        advantages: [T, B] or [T], advantage estimates.
+        returns: [T, B] or [T], discounted returns.
     """
     rewards = torch.as_tensor(rewards)
     values = torch.as_tensor(values)
     dones = torch.as_tensor(dones)
 
-    # 确保维度正确
+    # Ensure correct dimensions
     if rewards.dim() == 1:
         rewards = rewards.unsqueeze(1)
         values = values.unsqueeze(1)
@@ -38,62 +40,63 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     advantages = torch.zeros_like(rewards)
     returns = torch.zeros_like(rewards)
 
-    # 最后一步的TD残差
     last_gae = 0
 
-    # 反向计算
+    # Compute backwards through time
     for t in reversed(range(T)):
         if t == T - 1:
-            # 最后一步：用最后的状态价值
+            # Final step: use the terminal state value
             next_values = values[t + 1]
             next_non_terminal = 1.0 - dones[t]
         else:
             next_values = values[t + 1]
             next_non_terminal = 1.0 - dones[t]
 
-        # TD残差
+        # Temporal difference residual
         delta = rewards[t] + gamma * next_values * next_non_terminal - values[t]
 
-        # GAE
+        # GAE accumulation
         advantages[t] = last_gae = delta + gamma * lam * next_non_terminal * last_gae
 
-        # 折扣回报
+        # Discounted return
         returns[t] = advantages[t] + values[t]
 
     return advantages, returns
 
-class Critic(nn.Module):
-    """分位数 Critic，forward 只接受一个特征张量 h。
 
-    该类在 `MolecularRLAgent` 中被用作分位数价值函数估计器：
-    - 输入维度为 `hidden_dim * 2`，通常是 encoder 输出经线性层投影后的特征；
-    - 输出为 `num_quantiles` 个分位数，用于风险敏感的价值估计。
+class Critic(nn.Module):
+    """
+    Quantile distributional critic for risk-sensitive value estimation.
+
+    Used within MolecularRLAgent to estimate a distribution over state
+    values rather than a single point estimate. Input is expected to be
+    a feature tensor of shape [batch_size, hidden_dim * 2] from the
+    encoder projection layer.
     """
 
     def __init__(self, hidden_dim, num_quantiles=16):
         """
-        参数
-        ----
-        hidden_dim : int
-            与 Agent 的隐藏维度一致，Critic 实际输入维度为 2 * hidden_dim。
-        num_quantiles : int
-            输出的分位数个数。
+        Args:
+            hidden_dim: Hidden dimension matching the agent's encoder output.
+                        The actual input dimension is 2 * hidden_dim.
+            num_quantiles: Number of quantiles to output.
         """
         super().__init__()
 
         if hidden_dim is None:
             raise ValueError(
-                "Critic.hidden_dim 不能为 None，请在构造时显式传入 hidden_dim。"
+                "Critic.hidden_dim must not be None. "
+                "Please pass hidden_dim explicitly when constructing Critic."
             )
 
-        # 简化注意力机制（当前只在长度为 1 的序列上做 self-attention）
+        # Lightweight self-attention over the feature dimension
         self.attention = nn.MultiheadAttention(
             embed_dim=hidden_dim * 2,
             num_heads=4,
             batch_first=True
         )
 
-        # 简化值网络：2 * hidden_dim → num_quantiles
+        # Value network: 2 * hidden_dim → num_quantiles
         self.value_net = nn.Sequential(
             nn.Linear(hidden_dim * 2, 256),
             nn.LayerNorm(256),
@@ -102,7 +105,7 @@ class Critic(nn.Module):
             nn.Linear(256, num_quantiles),
         )
 
-        # 初始化
+        # Initialize weights
         for layer in self.value_net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight, gain=0.1)
@@ -110,29 +113,27 @@ class Critic(nn.Module):
 
     def forward(self, h):
         """
-        只接受一个参数 h。
+        Forward pass for the quantile critic.
 
-        参数
-        ----
-        h : torch.Tensor
-            形状为 [batch_size, hidden_dim * 2] 或
-            [batch_size, seq_len, hidden_dim * 2] 的特征张量。
-            在当前实现中，通常是由 `MolecularRLAgent.encoder` 输出，
-            经过 `critic_proj` 投影得到的 [batch_size, 2 * hidden_dim]。
+        Args:
+            h: Feature tensor of shape [batch_size, hidden_dim * 2] or
+               [batch_size, seq_len, hidden_dim * 2].
+
+        Returns:
+            Quantile values of shape [batch_size, num_quantiles].
         """
-        # 确保 h 是 3D 张量 [batch_size, seq_len, hidden_dim * 2]
+        # Ensure h is 3D: [batch_size, seq_len, hidden_dim * 2]
         if h.dim() == 2:
-            h = h.unsqueeze(1)  # [batch_size, 1, hidden_dim*2]
+            h = h.unsqueeze(1)
 
-        # 分割h为query, key, value
         batch_size = h.size(0)
         hidden_dim = h.size(2) // 2
 
-        # 简单处理：使用h作为query和key
+        # Self-attention over the feature dimension
         attn_output, _ = self.attention(h, h, h)
         attn_output = attn_output.squeeze(1)
 
-        # 值预测
+        # Value prediction
         quantiles = self.value_net(attn_output)
         quantiles = torch.clamp(quantiles, -300.0, 300.0)
 
@@ -140,29 +141,33 @@ class Critic(nn.Module):
 
 
 class MolecularRLAgent(nn.Module):
-    """在 CJT-VAE 潜空间上做连续动作 PPO 的主 Agent。
+    """
+    PPO agent operating on the CJT-VAE latent space with continuous actions.
 
-    当前实现将 z 视为一个整体向量进行编码，并未实际使用 tree/graph 分拆；
-    `tree_dim` / `graph_dim` 参数仅为兼容旧实验接口而保留。
+    The agent encodes a latent vector z into a shared hidden representation,
+    then uses separate Actor and Critic heads for policy and value estimation.
+    The Actor outputs a Gaussian policy over latent displacements, and the
+    Critic provides quantile-based distributional value estimates.
     """
 
     def __init__(
             self,
-            z_dim=48,  # 输入维度
-            tree_dim=24,  # tree部分维度
-            graph_dim=24,  # graph部分维度
+            z_dim=48,
+            tree_dim=24,
+            graph_dim=24,
             hidden_dim=128,
-            action_dim=48,  # 输出维度
+            action_dim=48,
             num_quantiles=8
     ):
         super().__init__()
 
         self.z_dim = z_dim
-        # 以下两个字段源自早期的结构化 latent 设计，当前实现未实际使用。
+        # These fields originate from an earlier structured latent design
+        # and are currently retained for interface compatibility only.
         self.tree_dim = tree_dim
         self.graph_dim = graph_dim
 
-        # 简化编码器（共享特征提取）
+        # Shared encoder for feature extraction
         self.encoder = nn.Sequential(
             nn.Linear(z_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -172,35 +177,35 @@ class MolecularRLAgent(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
-        # Actor 的自注意力层，在共享特征 h 上做一次轻量的 self-attention
+        # Lightweight self-attention for the Actor head
         self.actor_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=4,
             batch_first=True
         )
 
-        # Actor网络
+        # Actor mean network: outputs action mean in [-1, 1]
         self.actor_mu = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, action_dim),
-            nn.Tanh()  # 限制输出范围[-1, 1]
+            nn.Tanh()
         )
 
-        # Actor的对数标准差
+        # Actor log-standard deviation (learnable parameter)
         self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
 
-        # Critic网络
+        # Quantile distributional critic
         self.critic = Critic(
             hidden_dim=hidden_dim,
             num_quantiles=num_quantiles
         )
 
-        # Critic输入投影层
+        # Projection layer for critic input (hidden_dim → 2 * hidden_dim)
         self.critic_proj = nn.Linear(hidden_dim, hidden_dim * 2)
 
-        # 分位数位置
+        # Quantile target positions
         self.register_buffer(
             "taus",
             torch.linspace(0.5 / num_quantiles, 1 - 0.5 / num_quantiles, num_quantiles)
@@ -208,16 +213,26 @@ class MolecularRLAgent(nn.Module):
 
     # ---------- Actor ----------
     def act(self, z):
-        h = self.encoder(z)                 # [B, H]
+        """
+        Sample an action from the current policy.
 
-        # 自注意力：先转成 [B, 1, H]，做一次 self-attention，再还原为 [B, H]
-        h_seq = h.unsqueeze(1)              # [B, 1, H]
+        Args:
+            z: Latent vector of shape [B, z_dim].
+
+        Returns:
+            action: Sampled displacement of shape [B, action_dim].
+            log_prob: Log probability of the sampled action [B].
+        """
+        h = self.encoder(z)
+
+        # Self-attention: reshape to [B, 1, H], apply, then flatten back
+        h_seq = h.unsqueeze(1)
         attn_out, _ = self.actor_attn(h_seq, h_seq, h_seq)
-        h_attn = attn_out.squeeze(1)        # [B, H]
+        h_attn = attn_out.squeeze(1)
 
         mu = self.actor_mu(h_attn)
 
-        # 固定标准差
+        # Fixed standard deviation
         log_std = self.actor_log_std
         std = torch.exp(log_std)
 
@@ -230,17 +245,36 @@ class MolecularRLAgent(nn.Module):
 
     # ---------- Critic ----------
     def evaluate(self, z):
+        """
+        Estimate quantile values for a given latent state.
+
+        Args:
+            z: Latent vector of shape [B, z_dim].
+
+        Returns:
+            Quantile values of shape [B, num_quantiles].
+        """
         h = self.encoder(z)
 
-        # 投影为Critic输入
+        # Project to critic input dimension
         critic_input = self.critic_proj(h)
 
-        # Critic只需要一个参数
         quantiles = self.critic(critic_input)
         return quantiles
 
     # ---------- Value ----------
     def value(self, z, mode="mean", alpha=0.25):
+        """
+        Compute a scalar value estimate from quantile predictions.
+
+        Args:
+            z: Latent vector of shape [B, z_dim].
+            mode: Aggregation mode — "mean" or "cvar" (Conditional Value at Risk).
+            alpha: Fraction of lower quantiles for CVaR.
+
+        Returns:
+            Scalar value estimate of shape [B].
+        """
         quantiles = self.evaluate(z)
 
         if mode == "mean":
@@ -251,9 +285,19 @@ class MolecularRLAgent(nn.Module):
         else:
             raise ValueError(f"Unknown value mode: {mode}")
 
+
 def quantile_huber_loss(pred, target, taus, kappa=1.0):
     """
-    pred, target: [B, N]
+    Quantile regression Huber loss.
+
+    Args:
+        pred: Predicted quantiles of shape [B, N].
+        target: Target values of shape [B].
+        taus: Quantile target positions of shape [N].
+        kappa: Huber loss threshold.
+
+    Returns:
+        Scalar loss value.
     """
     diff = target.unsqueeze(1) - pred.unsqueeze(2)
     abs_diff = diff.abs()
@@ -270,19 +314,25 @@ def quantile_huber_loss(pred, target, taus, kappa=1.0):
     return loss.mean()
 
 
-# 修改agent.py中的PPOTrainer
-# agent.py - 修复PPOTrainer.update方法
 class MultiStepPPOTrainer:
+    """
+    Proximal Policy Optimization trainer with multi-step trajectory support.
+
+    Collects trajectories of length rollout_steps, computes GAE advantages,
+    and performs multiple epochs of PPO updates with clipping, entropy
+    regularization, and optional early stopping based on KL divergence.
+    """
+
     def __init__(self, agent, lr=1e-4, clip_eps=0.1, vf_coef=0.5,
                  ent_coef=0.01, max_grad_norm=0.3, train_iters=4,
                  target_kl=0.01, value_mode="mean", cvar_alpha=0.25,
                  device="cpu", warmup_steps=1000,
                  gamma=0.99, gae_lambda=0.95, rollout_steps=2):
         """
-        新增参数：
-        gamma: 折扣因子，默认0.99
-        gae_lambda: GAE lambda参数，默认0.95
-        rollout_steps: rollout步数，默认2步
+        Args:
+            gamma: Discount factor (default 0.99).
+            gae_lambda: GAE lambda parameter (default 0.95).
+            rollout_steps: Number of steps per trajectory (default 2).
         """
         self.agent = agent
         self.device = device
@@ -296,7 +346,7 @@ class MultiStepPPOTrainer:
         self.value_mode = value_mode
         self.cvar_alpha = cvar_alpha
 
-        # 新增：多步参数
+        # Multi-step trajectory parameters
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.rollout_steps = rollout_steps
@@ -311,27 +361,39 @@ class MultiStepPPOTrainer:
         )
 
     def update_trajectory(self, states, actions, old_logps, rewards, dones=None):
-        """多步轨迹PPO更新 - 完全修正版"""
-        # ========= 1. 转换输入格式 =========
+        """
+        Perform a multi-step PPO update from a collected trajectory.
+
+        Args:
+            states: Latent states of shape [B, T+1, D] or list of length T+1.
+            actions: Actions of shape [B, T, D] or list of length T.
+            old_logps: Old log-probabilities of shape [B, T] or list of length T.
+            rewards: Rewards of shape [B, T] or list of length T.
+            dones: Terminal flags of shape [B, T] or list of length T (optional).
+
+        Returns:
+            Dictionary of training metrics averaged over update iterations.
+        """
+        # Step 1: Convert inputs to tensors
         if isinstance(states, list):
-            states = torch.stack(states, dim=1)  # [B, T+1, D]
+            states = torch.stack(states, dim=1)        # [B, T+1, D]
         if isinstance(actions, list):
-            actions = torch.stack(actions, dim=1)  # [B, T, D]
+            actions = torch.stack(actions, dim=1)      # [B, T, D]
         if isinstance(old_logps, list):
             old_logps = torch.stack(old_logps, dim=1)  # [B, T]
         if isinstance(rewards, list):
-            rewards = torch.stack(rewards, dim=1)  # [B, T]
+            rewards = torch.stack(rewards, dim=1)      # [B, T]
 
         batch_size, T, action_dim = actions.shape
         state_dim = states.shape[-1]
 
-        # ========= 2. 如果没有提供dones，假设都没终止 =========
+        # Step 2: Default dones to all False if not provided
         if dones is None:
             dones = torch.zeros(batch_size, T, device=self.device)
         elif isinstance(dones, list):
             dones = torch.stack(dones, dim=1)
 
-        # ========= 3. 计算状态价值（不需要梯度） =========
+        # Step 3: Compute state values (no gradient required)
         with torch.no_grad():
             values = []
             for t in range(T + 1):
@@ -341,13 +403,11 @@ class MultiStepPPOTrainer:
                 values.append(value_t)
             values = torch.stack(values, dim=1)  # [B, T+1]
 
-        # ========= 2. 计算GAE优势 =========
-        # 先转成 [T, B]
-        rewards_t = rewards.transpose(0, 1)  # [T, B]
-        values_t = values.transpose(0, 1)  # [T+1, B]
-        dones_t = dones.transpose(0, 1)  # [T, B]
-
-        #rewards_t = (rewards_t - rewards_t.mean()) / (rewards_t.std() + 1e-8)
+        # Step 4: Compute GAE advantages
+        # Transpose to [T, B] for the GAE function
+        rewards_t = rewards.transpose(0, 1)      # [T, B]
+        values_t = values.transpose(0, 1)        # [T+1, B]
+        dones_t = dones.transpose(0, 1)          # [T, B]
 
         advantages_t, returns_t = compute_gae(
             rewards_t,
@@ -357,23 +417,22 @@ class MultiStepPPOTrainer:
             lam=self.gae_lambda
         )
 
-
-        # 再转回 [B, T]
+        # Transpose back to [B, T]
         advantages = advantages_t.transpose(0, 1)
         returns = returns_t.transpose(0, 1)
 
-        # 归一化优势
+        # Normalize advantages and returns
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-        # ========= 5. 展平数据 =========
-        states_flat = states[:, :-1, :].reshape(-1, state_dim).detach()  # ✅ 一开始就detach
-        actions_flat = actions.reshape(-1, action_dim).detach()  # ✅ 动作也detach
-        old_logps_flat = old_logps.reshape(-1).detach()  # ✅ logp也detach
-        advantages_flat = advantages.reshape(-1).detach()  # ✅ 优势也detach
-        returns_flat = returns.reshape(-1).detach()  # ✅ 回报也detach
+        # Step 5: Flatten all tensors to [B*T, ...]
+        states_flat = states[:, :-1, :].reshape(-1, state_dim).detach()
+        actions_flat = actions.reshape(-1, action_dim).detach()
+        old_logps_flat = old_logps.reshape(-1).detach()
+        advantages_flat = advantages.reshape(-1).detach()
+        returns_flat = returns.reshape(-1).detach()
 
-        # ========= 6. 初始化指标 =========
+        # Step 6: Initialize metrics dictionary
         metrics = {
             "policy_loss": [], "critic_loss": [], "total_loss": [],
             "entropy": [], "kl_divergence": [], "gradient_norm": [],
@@ -389,9 +448,9 @@ class MultiStepPPOTrainer:
             "new_logp_mean": []
         }
 
-        # ========= 7. 多次迭代PPO更新 =========
+        # Step 7: Multiple PPO update iterations
         for iter_idx in range(self.train_iters):
-            # ----- 前向传播（每次迭代重新计算）-----
+            # Forward pass (recomputed each iteration)
             h = self.agent.encoder(states_flat)
             h_seq = h.unsqueeze(1)
             attn_out, _ = self.agent.actor_attn(h_seq, h_seq, h_seq)
@@ -399,64 +458,62 @@ class MultiStepPPOTrainer:
             mu = self.agent.actor_mu(h_attn)
             metrics["mu_std"].append(mu.std().item())
 
-            # 标准差处理（移除clamp！）
+            # Standard deviation
             log_std = self.agent.actor_log_std
             std = torch.exp(log_std)
             metrics["action_std"].append(std.mean().item())
 
-            # 创建分布
+            # Create action distribution
             dist = torch.distributions.Normal(mu, std)
 
-            # 新log概率
+            # New log-probabilities
             new_logp = dist.log_prob(actions_flat).sum(-1)
             metrics["new_logp_mean"].append(new_logp.mean().item())
 
-            # 熵
+            # Entropy bonus
             entropy = dist.entropy().mean()
 
-            # Ratio计算
+            # Importance sampling ratio
             log_ratio = new_logp - old_logps_flat
             ratio = torch.exp(log_ratio)
-            #ratio = torch.clamp(ratio, 0.1, 10.0)  # 限制ratio范围
             ratio_mean = ratio.mean().item()
             ratio_std = ratio.std().item()
 
-            # 策略损失
+            # Clipped policy loss
             surr1 = ratio * advantages_flat
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages_flat
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Critic损失
+            # Quantile critic loss
             quantiles = self.agent.evaluate(states_flat)
             target = returns_flat.unsqueeze(1).expand_as(quantiles)
             critic_loss = quantile_huber_loss(quantiles, target, self.agent.taus)
 
-            # 总损失
+            # Total loss: policy + value - entropy
             loss = policy_loss + self.vf_coef * critic_loss - self.ent_coef * entropy
             print(f'critic_loss: {critic_loss.item()} | policy_loss: {policy_loss.item()} | loss: {loss.item()}')
 
-
-            # ----- 优化步骤 -----
+            # Optimization step
             self.optimizer.zero_grad()
-            loss.backward()  # ✅ 每次迭代都是新的计算图
+            loss.backward()
 
-            # 梯度裁剪
+            # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.agent.parameters(),
                 self.max_grad_norm
             )
 
-            # 检查梯度
+            # Skip update if gradients are unstable
             if torch.isnan(grad_norm) or grad_norm > 100:
                 self.optimizer.zero_grad()
                 break
 
             self.optimizer.step()
 
-            # ----- KL散度检查 -----
+            # KL divergence check
             approx_kl = (old_logps_flat - new_logp).mean().item()
 
-            # 记录指标
+            # Record metrics for this iteration
             metrics["policy_loss"].append(policy_loss.item())
             metrics["critic_loss"].append(critic_loss.item())
             metrics["total_loss"].append(loss.item())
@@ -466,13 +523,9 @@ class MultiStepPPOTrainer:
             metrics["ratio_mean"].append(ratio_mean)
             metrics["ratio_std"].append(ratio_std)
 
-            # KL提前停止
-            # if approx_kl > 1.5 * self.target_kl and iter_idx > 0:
-            #     break
-
         self.update_step += 1
 
-        # ========= 8. 汇总指标 =========
+        # Step 8: Aggregate metrics across iterations
         out = {}
         for k in metrics:
             if isinstance(metrics[k], list) and metrics[k]:
@@ -488,6 +541,3 @@ class MultiStepPPOTrainer:
         out["gae_lambda"] = self.gae_lambda
 
         return out
-
-
-
