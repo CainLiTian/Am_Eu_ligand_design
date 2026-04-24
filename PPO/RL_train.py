@@ -26,9 +26,11 @@ from collections import defaultdict
 import numpy as np
 
 
+# Suppress RDKit logging
 RDLogger.DisableLog("rdApp.*")
 DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
+# ==================== Hyperparameters ====================
 LATENT_DIM = 48
 BATCH_SIZE = 16
 
@@ -43,7 +45,7 @@ VF_COEF = 0.5
 
 ROLLOUT_STEPS = 3
 TRAIN_ITERS = 3
-GAMMA = 0.9             # 折扣因子
+GAMMA = 0.9
 GAE_LAMBDA = 0.95
 
 REWARD_THRESHOLD_ = 5.5
@@ -51,6 +53,7 @@ TOPK_REPLAY = 2
 
 SIMILARITY_THRESHOLD = 0.8
 
+# ==================== Paths ====================
 CJTVAE_CKPT = "/home/dc/data_new/finetune/best_cjtvae_cond_finetuned_final.pth"
 VOCAB_PATH = "/home/dc/data_new/new_vocab.txt"
 XGB_MODEL_PATH = "/home/dc/data_new/XGB/XGB.pkl"
@@ -66,7 +69,15 @@ baseline_config.TOTAL_STEPS = TOTAL_UPDATES
 baseline_config.ROLLOUT_STEPS = ROLLOUT_STEPS
 baseline_config.SAVE_STEPS = SAVE_INTERVAL
 
+
 class StepTimeout:
+    """
+    Context manager for per-step timeout protection.
+
+    Raises a TimeoutError if the enclosed code block exceeds the specified
+    time limit. Also tracks the actual elapsed time for diagnostics.
+    """
+
     def __init__(self, step, timeout_seconds):
         self.step = step
         self.timeout_seconds = timeout_seconds
@@ -100,7 +111,7 @@ class StepTimeout:
             elapsed = time.time() - self.start_time
             if elapsed > self.timeout_seconds:
                 self.timed_out = True
-                print(f"\n⏰ Step {self.step} 实际耗时{elapsed:.1f}s超时")
+                print(f"\nTimeout: Step {self.step} exceeded limit (elapsed: {elapsed:.1f}s)")
 
         if exc_type is not None and exc_type == TimeoutError:
             return True
@@ -109,16 +120,24 @@ class StepTimeout:
 
 
 class EliteReplayBuffer:
+    """
+    Experience replay buffer that retains high-reward trajectories.
+
+    Maintains a fixed-size buffer of the best trajectories, with scaffold-based
+    deduplication to encourage chemical diversity. Supports sampling of initial
+    latent states from historically successful trajectories with added noise.
+    """
+
     def __init__(self, max_size=200, noise_std=0.05, similarity_threshold=0.8):
         self.max_size = max_size
         self.noise_std = noise_std
         self.similarity_threshold = similarity_threshold
         self.buffer = []
         self.scores = []
-        self.scaffolds = []  # 新增：存储每个轨迹的骨架
+        self.scaffolds = []
 
     def _get_scaffold(self, smiles):
-        """提取Murcko骨架"""
+        """Extract the Murcko scaffold from a SMILES string."""
         if smiles is None or smiles == '':
             return None
         try:
@@ -132,14 +151,18 @@ class EliteReplayBuffer:
             return None
 
     def _is_duplicate_scaffold(self, new_scaffold):
-        """检查新骨架是否与已有骨架重复"""
+        """
+        Check whether a scaffold is already present in the buffer.
+
+        Two scaffolds are considered duplicates if their Tanimoto similarity
+        exceeds the configured threshold.
+        """
         if new_scaffold is None:
             return False
 
         for existing_scaffold in self.scaffolds:
             if existing_scaffold is None:
                 continue
-            # 计算骨架相似度
             try:
                 mol1 = Chem.MolFromSmiles(new_scaffold)
                 mol2 = Chem.MolFromSmiles(existing_scaffold)
@@ -155,10 +178,15 @@ class EliteReplayBuffer:
         return False
 
     def add_trajectory(self, states, actions, rewards, final_reward, final_smiles):
-        # 骨架去重检查
+        """
+        Add a trajectory to the buffer with scaffold-based deduplication.
+
+        If a similar scaffold already exists, the new trajectory only replaces
+        the old one if it achieves a higher reward.
+        """
         new_scaffold = self._get_scaffold(final_smiles)
         if new_scaffold is not None and self._is_duplicate_scaffold(new_scaffold):
-            # 检查是否比已有同类骨架的奖励更高
+            # Check if the new trajectory outperforms the existing one with the same scaffold
             for i, existing_scaffold in enumerate(self.scaffolds):
                 if existing_scaffold is None:
                     continue
@@ -172,13 +200,13 @@ class EliteReplayBuffer:
                     sim = TanimotoSimilarity(fp1, fp2)
                     if sim >= self.similarity_threshold:
                         if final_reward > self.scores[i]:
-                            # 替换旧的
+                            # Replace the old entry
                             self.buffer.pop(i)
                             self.scores.pop(i)
                             self.scaffolds.pop(i)
                             break
                         else:
-                            # 奖励不如旧的，直接返回
+                            # Reward is not better; discard
                             return
                 except:
                     continue
@@ -196,7 +224,7 @@ class EliteReplayBuffer:
         self.scores.append(float(final_reward))
         self.scaffolds.append(new_scaffold)
 
-        # 按final_reward排序并保留top-k
+        # Sort by final_reward and keep only top-k
         if len(self.buffer) > self.max_size:
             sorted_indices = np.argsort(self.scores)[::-1]
             self.buffer = [self.buffer[i] for i in sorted_indices[:self.max_size]]
@@ -204,11 +232,20 @@ class EliteReplayBuffer:
             self.scaffolds = [self.scaffolds[i] for i in sorted_indices[:self.max_size]]
 
     def sample_initial_z(self, batch_size, latent_dim, device, sample_type='last_state'):
+        """
+        Sample initial latent vectors from the buffer.
+
+        Sampling is weighted by trajectory reward to favor high-performing
+        regions of the latent space.
+
+        Args:
+            sample_type: 'last_state', 'first_state', or 'random_state'.
+        """
         if len(self.buffer) == 0:
             return torch.randn(batch_size, latent_dim, device=device)
 
         scores = np.array(self.scores)
-        scores = scores - scores.min() + 1e-8  # 确保正数
+        scores = scores - scores.min() + 1e-8
         probs = scores / scores.sum()
 
         traj_indices = np.random.choice(
@@ -242,11 +279,23 @@ class EliteReplayBuffer:
 
 def collect_rollout(agent, env, z0, rollout_steps):
     """
-    收集轨迹，返回原始SF值而不是差分
+    Collect a multi-step trajectory by rolling out the current policy.
+
+    At each step, the agent predicts a latent displacement, the environment
+    decodes the new latent vector and computes rewards.
+
+    Returns:
+        states: List of latent states [z0, z1, ..., zT].
+        actions: List of actions taken.
+        logps: List of action log-probabilities.
+        reward_values: List of raw reward arrays.
+        smiles_list: List of decoded SMILES per step.
+        valid_list: List of validity masks per step.
+        infos_list: List of info dictionaries per step.
     """
-    states = [z0]  # 所有状态
-    actions = []  # 所有动作
-    logps = []  # 动作概率
+    states = [z0]
+    actions = []
+    logps = []
     reward_values = []
     smiles_list = []
     valid_list = []
@@ -254,23 +303,24 @@ def collect_rollout(agent, env, z0, rollout_steps):
 
     current_z = z0
 
-    # 获取初始状态的SF
+    # Evaluate the initial state
     smiles0, valid0 = env.decode(z0)
     reward0, info0 = env.compute_reward(z0, smiles0, valid0)
 
     for t in range(rollout_steps):
-        # 1. Actor决定动作
+        # Step 1: Actor predicts action
         action, logp = agent.act(current_z)
 
-        # 2. 状态更新
+        # Step 2: Update latent state
         next_z = current_z + action
 
-        print(f'第{t + 1}步解码中......')
+        print(f'Decoding step {t + 1}...')
         smiles, valid_mask = env.decode(next_z)
-        print(f'smiles: {smiles}解码成功')
+        print(f'SMILES: {smiles} — decoding successful')
         reward, infos = env.compute_reward(next_z, smiles, valid_mask)
-        print(f'奖励计算成功,奖励{reward}')
-        # 4. 存储数据
+        print(f'Reward computed: {reward}')
+
+        # Step 3: Store trajectory data
         states.append(next_z)
         actions.append(action)
         logps.append(logp)
@@ -279,7 +329,7 @@ def collect_rollout(agent, env, z0, rollout_steps):
         valid_list.append(valid_mask)
         infos_list.append(infos)
 
-        # 5. 更新当前状态
+        # Step 4: Update current state
         current_z = next_z
 
     return states, actions, logps, reward_values, smiles_list, valid_list, infos_list
@@ -287,6 +337,11 @@ def collect_rollout(agent, env, z0, rollout_steps):
 
 def record_batch_multi_step(step, trajectories, smiles_counter, records,
                             record_intermediate=False, record_final_only=True):
+    """
+    Record molecule-level results from a multi-step trajectory.
+
+    Can record only the final step or all intermediate steps.
+    """
     batch_size = len(trajectories['all_smiles'][0])
     num_steps = len(trajectories['all_smiles'])
 
@@ -314,7 +369,7 @@ def record_batch_multi_step(step, trajectories, smiles_counter, records,
 
                 rec = {
                     "step": step,
-                    "traj_step": t,  # 新增：轨迹中的步数
+                    "traj_step": t,
                     "index_in_batch": i,
                     "reward": float(rewards_t[i]),
                     "valid": bool(valid_t[i]),
@@ -339,7 +394,7 @@ def record_batch_multi_step(step, trajectories, smiles_counter, records,
                 if t < num_steps - 1:
                     rec["is_intermediate"] = True
                     if "soft_sf" not in rec or np.isnan(rec["soft_sf"]):
-                        rec["soft_sf"] = 0.0  # 默认值
+                        rec["soft_sf"] = 0.0
 
                 records.append(rec)
 
@@ -347,6 +402,7 @@ def record_batch_multi_step(step, trajectories, smiles_counter, records,
 
 
 def record_batch_single_step(step, smiles, rewards, valid_mask, infos, smiles_counter, records):
+    """Record results for a single-step batch."""
     batch_size = len(smiles)
 
     for i in range(batch_size):
@@ -379,7 +435,9 @@ def record_batch_single_step(step, smiles, rewards, valid_mask, infos, smiles_co
 
     return records
 
+
 def save_top_molecules(df, save_dir):
+    """Save the top-50 unique molecules by reward to an Excel file."""
     top_df = (
         df.sort_values("reward", ascending=False)
         .drop_duplicates("smiles")
@@ -387,7 +445,9 @@ def save_top_molecules(df, save_dir):
     )
     top_df.to_excel(os.path.join(save_dir, "top_molecules.xlsx"), index=False)
 
+
 def load_models():
+    """Load the pre-trained JT-VAE generator and XGBoost surrogate model."""
     vocab = Vocab([x.strip() for x in open(VOCAB_PATH)])
 
     cjtvae = JTNNVAE(
@@ -410,9 +470,15 @@ def load_models():
 
 
 def sample_initial_z_mixed(batch_size, latent_dim, device, replay_buffer, replay_ratio=0.2):
+    """
+    Sample initial latent vectors using a mixed strategy.
+
+    A fraction (replay_ratio) is drawn from the elite replay buffer,
+    and the remainder is sampled from the standard normal prior.
+    """
     z_list = []
 
-    # 1️⃣ replay部分
+    # Replay samples from elite buffer
     n_replay = int(batch_size * replay_ratio)
     if n_replay > 0 and len(replay_buffer) > 0:
         z_replay = replay_buffer.sample_initial_z(
@@ -430,17 +496,21 @@ def sample_initial_z_mixed(batch_size, latent_dim, device, replay_buffer, replay
     z0 = torch.cat(z_list, dim=0)
 
     if z0.shape[0] != batch_size:
-        print("⚠ 修正 batch 大小")
+        print("Warning: correcting batch size")
         z0 = torch.randn(batch_size, latent_dim, device=device)
 
     return z0
 
 
 def get_replay_ratio(step, total_steps=100):
-    # 中心点设在总步数的30%处
-    center = total_steps * 0.3  # 30%位置
+    """
+    Compute the replay ratio using a sigmoid schedule.
 
-    # 宽度设为总步数的15%
+    The ratio peaks around 30% of training and decays smoothly
+    towards the boundaries, encouraging more random exploration
+    early and late in training.
+    """
+    center = total_steps * 0.3
     width = total_steps * 0.15
 
     x = (step - center) / width
@@ -449,12 +519,17 @@ def get_replay_ratio(step, total_steps=100):
     return max(0.1, min(0.9, ratio))
 
 
-def apply_repeat_penalty_final_only(rewards_list, smiles_list, smiles_counter, coef=0.1, similarity_threshold=SIMILARITY_THRESHOLD):
+def apply_repeat_penalty_final_only(rewards_list, smiles_list, smiles_counter, coef=0.1, similarity_threshold=0.8):
     """
-    重复惩罚池子只包含最终步的分子，但中间步骤如果与最终步分子重复也会受到惩罚
+    Apply a repetition penalty to discourage generating the same molecules repeatedly.
+
+    The penalty pool is built from the final-step molecules, but intermediate
+    steps that are similar to any final-step molecule also receive a penalty.
+    The penalty strength scales with the Tanimoto similarity.
 
     Args:
-        similarity_threshold: 相似度阈值，默认为1.0（完全匹配）。设为0.9则相似度>0.9即视为重复
+        similarity_threshold: Molecules with similarity above this threshold
+                              are considered duplicates (default 0.8).
     """
     num_steps = len(rewards_list)
     batch_size = len(rewards_list[0])
@@ -462,10 +537,9 @@ def apply_repeat_penalty_final_only(rewards_list, smiles_list, smiles_counter, c
 
     final_step_idx = num_steps - 1
 
-    # 辅助函数：计算相似度
     def get_similarity(smi1, smi2):
-        """计算两个SMILES的Tanimoto相似度"""
-        if smi1 == smi2:  # 完全相同直接返回1，跳过计算
+        """Compute Tanimoto similarity between two SMILES strings."""
+        if smi1 == smi2:
             return 1.0
         try:
             mol1 = Chem.MolFromSmiles(smi1)
@@ -478,14 +552,14 @@ def apply_repeat_penalty_final_only(rewards_list, smiles_list, smiles_counter, c
         except:
             return 0.0
 
-    # 1. 统计最后一步的分子（构建惩罚池）
-    final_smiles_pool = defaultdict(int)  # 记录每个最终分子在当前batch中出现的次数
+    # Step 1: Build the penalty pool from final-step molecules
+    final_smiles_pool = defaultdict(int)
     for i in range(batch_size):
         smi = smiles_list[final_step_idx][i]
-        if smi:  # 只统计有效分子
+        if smi:
             final_smiles_pool[smi] += 1
 
-    # 2. 对所有步应用惩罚（基于最终步分子池）
+    # Step 2: Apply penalty to all steps based on the final-step pool
     for t in range(num_steps):
         step_adjusted = []
         step_rewards = rewards_list[t]
@@ -495,15 +569,14 @@ def apply_repeat_penalty_final_only(rewards_list, smiles_list, smiles_counter, c
             r = step_rewards[i]
             smi = step_smiles[i]
 
-            if not smi:  # 无效分子，不调整
+            if not smi:
                 step_adjusted.append(r)
                 continue
 
-            # 检查这个分子是否与最终步分子池中的任何分子相似
+            # Check similarity to any molecule in the final-step pool
             is_similar = False
             max_similarity = 0.0
 
-            # 只有当相似度阈值小于1时才需要计算相似度
             if similarity_threshold < 1.0:
                 for final_smi in final_smiles_pool.keys():
                     sim = get_similarity(smi, final_smi)
@@ -512,23 +585,23 @@ def apply_repeat_penalty_final_only(rewards_list, smiles_list, smiles_counter, c
                         is_similar = True
                         break
             else:
-                # 阈值=1.0时保持原有逻辑，只检查完全匹配
                 is_similar = (smi in final_smiles_pool)
                 max_similarity = 1.0 if is_similar else 0.0
 
             if is_similar:
-                global_count = smiles_counter.get(smi, 0)  # 历史出现次数
-                # 计算当前batch中相似的最终分子数量
+                global_count = smiles_counter.get(smi, 0)
+
+                # Count similar molecules in the current batch
                 if similarity_threshold < 1.0:
                     batch_count = 0
                     for final_smi, count in final_smiles_pool.items():
                         if get_similarity(smi, final_smi) >= similarity_threshold:
                             batch_count += count
                 else:
-                    batch_count = final_smiles_pool[smi]  # 当前batch中作为最终步出现的次数
+                    batch_count = final_smiles_pool[smi]
 
                 total_visits = global_count + batch_count
-                # 根据相似度调整惩罚强度（越相似惩罚越重）
+                # Scale penalty by similarity
                 penalty_multiplier = max_similarity if similarity_threshold < 1.0 else 1.0
                 penalty = coef * penalty_multiplier * np.log(total_visits + 1)
                 adjusted = r - penalty
@@ -539,13 +612,15 @@ def apply_repeat_penalty_final_only(rewards_list, smiles_list, smiles_counter, c
 
         adjusted_list.append(np.array(step_adjusted, dtype=np.float32))
 
-    # 3. 更新全局计数器（只累加最终步的分子）
+    # Step 3: Update global counter (only for final-step molecules)
     for smi, count in final_smiles_pool.items():
         smiles_counter[smi] += count
 
     return adjusted_list, smiles_counter
 
+
 def main():
+    """Main PPO training loop for latent-space ligand optimization."""
     print("Using device:", DEVICE)
 
     cjtvae, xgb_model, vocab = load_models()
@@ -569,9 +644,9 @@ def main():
         clip_eps=CLIP_EPS,
         vf_coef=VF_COEF,
         device=DEVICE,
-        gamma=0.9,  # 折扣因子（对短轨迹用稍小的值）
-        gae_lambda=0.95,  # GAE lambda
-        rollout_steps=ROLLOUT_STEPS,  # rollout步数（从2步开始）
+        gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
+        rollout_steps=ROLLOUT_STEPS,
         train_iters=TRAIN_ITERS
     )
 
@@ -589,7 +664,7 @@ def main():
 
     for step in trange(1, TOTAL_UPDATES + 1, desc="PPO Training"):
         with StepTimeout(step, 120) as timeout:
-            # ========= 采样初始点 =========
+            # Sample initial latent points (mixed random + replay)
             replay_ratio = get_replay_ratio(step, TOTAL_UPDATES)
 
             z0 = sample_initial_z_mixed(
@@ -599,25 +674,26 @@ def main():
                 replay_buffer=replay_buffer,
                 replay_ratio=replay_ratio
             )
-            print('初始点采样完成')
-            # ========= 多步rollout =========
+            print('Initial states sampled')
+
+            # Multi-step rollout
             states, actions, logps, raw_rewards_list, smiles_list, valid_list, infos_list = \
                 collect_rollout(agent, env, z0, ppo.rollout_steps)
 
-            # ========= 重复惩罚 =========
+            # Apply repetition penalty
             adjusted_rewards_list, smiles_counter = apply_repeat_penalty_final_only(
-                raw_rewards_list, smiles_list, smiles_counter, coef=0.2,similarity_threshold=SIMILARITY_THRESHOLD
+                raw_rewards_list, smiles_list, smiles_counter, coef=0.2, similarity_threshold=SIMILARITY_THRESHOLD
             )
 
-
-
+            # Build terminal flags (only the last step is terminal)
             dones = []
             for t in range(ppo.rollout_steps):
                 if t == ppo.rollout_steps - 1:
                     dones.append(torch.ones(BATCH_SIZE, device=DEVICE))
                 else:
                     dones.append(torch.zeros(BATCH_SIZE, device=DEVICE))
-            # ========= PPO更新 =========
+
+            # PPO update
             rewards_tensors = [torch.tensor(r, device=DEVICE) for r in adjusted_rewards_list]
             update_metrics = ppo.update_trajectory(
                 states=states,
@@ -626,9 +702,9 @@ def main():
                 rewards=rewards_tensors,
                 dones=dones,
             )
-            print('PPO更新完成')
+            print('PPO update completed')
 
-            # ========= 提取最终步数据 =========
+            # Extract final-step data
             final_z = states[-1]
             final_smiles = smiles_list[-1]
             final_valid_mask = valid_list[-1]
@@ -641,7 +717,7 @@ def main():
             if update_metrics is not None:
                 metrics_history.append(update_metrics)
 
-            # ========= 记录数据（只记录一次！）=========
+            # Record trajectory data
             trajectories_data = {
                 'all_smiles': smiles_list,
                 'all_rewards': adjusted_rewards_list,
@@ -658,7 +734,7 @@ def main():
                 record_final_only=False,
             )
 
-            # ========= 回放缓冲区 =========
+            # Update elite replay buffer
             for t in range(ppo.rollout_steps):
                 infos_t = infos_list[t]
                 smiles_t = smiles_list[t]
@@ -669,8 +745,8 @@ def main():
                     if not valid_list[t][i]:
                         continue
 
-                    total_reward = rewards_t[i]  # 改用Total Reward
-                    if total_reward >= REWARD_THRESHOLD_:  # 改用Total Reward阈值
+                    total_reward = rewards_t[i]
+                    if total_reward >= REWARD_THRESHOLD_:
                         candidates.append((total_reward, i))
 
                 candidates.sort(reverse=True)
@@ -684,8 +760,7 @@ def main():
                         final_smiles=smiles_t[i]
                     )
 
-
-        # ========= 日志输出 =========
+        # Logging
         if step % LOG_INTERVAL == 0:
             valid_count = sum(final_valid_mask)
             valid_ratio = valid_count / BATCH_SIZE
@@ -697,12 +772,11 @@ def main():
             max_sf = np.max(sf_values) if sf_values else 0
 
             print(f"\n[Step {step}]")
-            print(f"  有效分子: {valid_count}/{BATCH_SIZE} ({valid_ratio:.0%})")
-            print(f"  最终奖励: 平均={avg_reward:.3f}, 最高={max_reward:.3f}")
-            print(f"  最终SF值: 平均={avg_sf:.3f}, 最高={max_sf:.3f}")
+            print(f"  Valid molecules: {valid_count}/{BATCH_SIZE} ({valid_ratio:.0%})")
+            print(f"  Final reward: mean={avg_reward:.3f}, max={max_reward:.3f}")
+            print(f"  Final SF: mean={avg_sf:.3f}, max={max_sf:.3f}")
 
-        # ========= 更新最佳记录（从records中获取）=========
-        # 不需要再遍历records，直接比较final_rewards
+        # Update best record
         for i in range(BATCH_SIZE):
             if final_valid_mask[i] and final_rewards[i] > best_reward:
                 best_reward = final_rewards[i]
@@ -714,8 +788,8 @@ def main():
                     "soft_sf": final_infos[i].get("soft_sf", np.nan),
                 }
 
+        # Periodic saving
         if step % SAVE_INTERVAL == 0:
-
             torch.save(
                 {
                     "agent": agent.state_dict(),
@@ -732,20 +806,16 @@ def main():
             metrics_df = pd.DataFrame(metrics_history)
             metrics_df.to_csv(os.path.join(SAVE_DIR, "training_metrics.csv"), index=False)
 
-
-
             final_plot_path = os.path.join(SAVE_DIR, "final_training_metrics.png")
             plot_training_metrics(metrics_history, save_path=final_plot_path)
 
             save_top_molecules(df, SAVE_DIR)
 
-
     print("\nTraining finished.")
     print("Best reward:", best_reward)
     print("Best molecule:", best_record["smiles"])
 
-    # print("\n========== Running Control Groups ==========")
-    # PPO dataframe
+    # Generate baseline comparison plots
     ppo_df = pd.DataFrame(records)
 
     plot_baseline_results(
