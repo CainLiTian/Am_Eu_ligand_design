@@ -21,30 +21,44 @@ This module implements the Junction Tree Variational Autoencoder (JT-VAE) for mo
 
 ```bash
 python trainjtnn.py
-Training configuration and hyperparameters are defined at the top of trainjtnn.py. The script supports:
+```
 
-Pretraining on CSD-derived metal–organic complexes
+Training configuration and hyperparameters are defined at the top of `trainjtnn.py`. The script supports:
 
-Transfer learning (fine-tuning) on Am/Eu extraction ligands
+- **Pretraining** on CSD-derived metal–organic complexes
+- **Transfer learning** (fine-tuning) on Am/Eu extraction ligands
+- **Conditional generation** with solvent feature vectors
+- KL annealing with linear warm-up schedule
+- Cosine annealing and plateau-based learning rate scheduling
+- Early stopping based on validation loss
 
-Conditional generation with solvent feature vectors
+## Key Modifications from Original JT-VAE
 
-KL annealing with linear warm-up schedule
+- Added **conditional generation** support (`cond_dim`) for solvent-conditioned decoding
+- Increased **dropout regularization** (0.3) to mitigate overfitting on small datasets
+- Added **LayerNorm** in the decoder aggregation module
+- **Transfer learning mode**: encoder weights can be frozen while fine-tuning decoder and latent mapping layers
+- **Timeout-protected decoding** via multiprocessing to prevent hanging on invalid latent points
 
-Cosine annealing and plateau-based learning rate scheduling
+## Reference
 
-Early stopping based on validation loss
+Jin, W., Barzilay, R., & Jaakkola, T. (2018). Junction Tree Variational Autoencoder for Molecular Graph Generation. *Proceedings of the 35th International Conference on Machine Learning (ICML)*.
 
-Key Modifications from Original JT-VAE
-Added conditional generation support (cond_dim) for solvent-conditioned decoding
+## Usage
 
-Increased dropout regularization (0.3) to mitigate overfitting on small datasets
+```python
+from jtnn_vae import JTNNVAE
+from vocab import Vocab
 
-Added LayerNorm in the decoder aggregation module
+# Load vocabulary
+vocab = Vocab(["vocab.txt"])
 
-Transfer learning mode: encoder weights can be frozen while fine-tuning decoder and latent mapping layers
+# Initialize model
+model = JTNNVAE(vocab, hidden_size=256, latent_size=48, depthT=15, depthG=3, cond_dim=8)
 
-Timeout-protected decoding via multiprocessing to prevent hanging on invalid latent points
+# Encode molecules
+z_tree, z_mol, z_combined = model.get_sampled_latent_vector(["c1ccccc1"])
 
-Reference
-Jin, W., Barzilay, R., & Jaakkola, T. (2018). Junction Tree Variational Autoencoder for Molecular Graph Generation. Proceedings of the 35th International Conference on Machine Learning (ICML).
+# Decode from latent vector
+smiles = model.decode_from_latent(z_combined)
+```
